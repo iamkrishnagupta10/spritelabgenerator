@@ -4,6 +4,7 @@ import sharp from "sharp";
 type CharacterName = "doux" | "mort" | "targ" | "vita";
 
 function atlasDataGenerator(name: CharacterName) {
+  // STRICTLY match mort.json structure
   const baseAtlas: any = {
     frames: {},
     meta: {
@@ -42,28 +43,23 @@ async function hasAnyTransparency(png: Buffer) {
   return false;
 }
 
-// Slice a 5x5 grid from the 1024x1024 source and stitch the first 24 into a 1x24 strip
-async function sliceAndStitchTo576x24(sourcePng: Buffer) {
-  // 1. Get raw dimensions just to be sure
+// Slice a 5x5 grid and re-map to strict mort.json indices
+// Target: 24 frames total (0-23)
+// IDLE: 0,1,2,3 (4 frames)
+// WALK: 4,5,6,7,8,9 (6 frames)
+async function sliceAndStitchStrict(sourcePng: Buffer) {
   const sourceImage = sharp(sourcePng).ensureAlpha();
   const meta = await sourceImage.metadata();
   const width = meta.width || 1024;
   const height = meta.height || 1024;
 
-  // We assume a 5x5 grid in the square image.
-  // Cell size = width / 5.
   const cellW = Math.floor(width / 5);
   const cellH = Math.floor(height / 5);
 
-  const frames: Buffer[] = [];
-
-  // Extract 25 frames (rows 0..4, cols 0..4), keep first 24.
-  let count = 0;
+  // We need to extract 25 source cells (0..24)
+  const sourceCells: Buffer[] = [];
   for (let row = 0; row < 5; row++) {
     for (let col = 0; col < 5; col++) {
-      if (count >= 24) break;
-
-      // Extract region
       const buffer = await sourceImage
         .clone()
         .extract({
@@ -76,18 +72,54 @@ async function sliceAndStitchTo576x24(sourcePng: Buffer) {
           fit: "contain",
           background: { r: 0, g: 0, b: 0, alpha: 0 },
           kernel: sharp.kernel.nearest,
-        }) // Resize perfectly to 24x24 pixel art
+        })
         .toBuffer();
-
-      frames.push(buffer);
-      count++;
+      sourceCells.push(buffer);
     }
   }
 
-  // Composite frames into a 576x24 canvas
-  // X offsets: 0, 24, 48, ...
-  const compositeOps = frames.map((buf, idx) => ({
-    input: buf,
+  // MAPPING logic
+  // sourceCells indices:
+  // Row 0: 0,1,2,3,4
+  // Row 1: 5,6,7,8,9
+  // Row 2: 10,11,12,13,14 ...
+
+  const destFrames: Buffer[] = new Array(24).fill(null);
+
+  // IDLE (0-3) <- Source Row 0 [0,1,2,3]
+  // We skip Source [4] (Row 0, col 4) effectively, or use it later?
+  // Our prompt will ask for 5 frames of Idle in Row 1. We take 4.
+  destFrames[0] = sourceCells[0];
+  destFrames[1] = sourceCells[1];
+  destFrames[2] = sourceCells[2];
+  destFrames[3] = sourceCells[3];
+
+  // WALK (4-9) <- Source Row 1 [5,6,7,8,9] + Row 2 [10]
+  // Prompt asks for 5-6 frames of walk in Row 2.
+  // We'll map Source Row 1 (indices 5-9) to Dest 4-8.
+  // And Source Row 2 first cell (index 10) to Dest 9.
+
+  destFrames[4] = sourceCells[5]; // Walk 1
+  destFrames[5] = sourceCells[6]; // Walk 2
+  destFrames[6] = sourceCells[7]; // Walk 3
+  destFrames[7] = sourceCells[8]; // Walk 4
+  destFrames[8] = sourceCells[9]; // Walk 5
+  destFrames[9] = sourceCells[10]; // Walk 6 (from next row)
+
+  // Fill the rest (10-23) with transparent blank or just copy idle
+  // to avoid broken images if the app cycles indiscriminately.
+  // We'll create a blank frame.
+  const blank = await sharp({
+    create: { width: 24, height: 24, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } }
+  }).png().toBuffer();
+
+  for (let i = 10; i < 24; i++) {
+    destFrames[i] = blank;
+  }
+
+  // Composite into 576x24 strip
+  const compositeOps = destFrames.map((buf, idx) => ({
+    input: buf || blank,
     left: idx * 24,
     top: 0,
   }));
@@ -129,20 +161,23 @@ Generate ONE single 24x24 pixel art character on a transparent background.
 - Output: A single transparent PNG (approx 256x256 or 512x512, will be downscaled).
 `.trim();
   } else {
-    // Sheet mode: The "Strict Generator" logic
+    // Sheet mode: STRICT ALIGNMENT
     systemPrompt = `
 You are a pixel art generator.
 Generate a valid 5x5 GRID of sprites.
 - The output image is square (e.g. 1024x1024).
-- Divide it visually into 5 rows and 5 columns.
+- Divide it visually into 5 rows (Row 1 to Row 5) and 5 columns.
 - Place ONE character sprite in each cell.
-- Total 25 sprites (we will use the first 24).
+
+STRICT ROW CONTENTS:
+- Row 1 (Top): 5 frames of IDLE animation (breathing, subtle movement).
+- Row 2 (2nd down): 5 frames of WALK cycle (Side view walking).
+- Row 3 (3rd down): 5 frames continuing the walk cycle or running.
+- Row 4/5: Variations.
+
 - Background MUST be transparent.
 - Characters should be small, centered in their grid cells.
-- Style: Retro pixel art, NES/SNES style.
-- Rows 1: Idle animation frames.
-- Rows 2-5: Walk cycle & action frames.
-- Consistency: MUST match the user's provided character concept EXACTLY.
+- Consistency: MATCH the concept prompt exactly.
 `.trim();
   }
 
@@ -200,9 +235,8 @@ export async function POST(req: Request) {
         pngBase64: preview.toString("base64")
       });
     } else {
-      // Sheet mode: Slice & Stitch
-      // We assume 'prompt' here is the "strict" description
-      const finalPng = await sliceAndStitchTo576x24(raw!);
+      // Sheet mode: Strict Slice & Map
+      const finalPng = await sliceAndStitchStrict(raw!);
       const metadata = name ? atlasDataGenerator(name as CharacterName) : {};
 
       return NextResponse.json({
