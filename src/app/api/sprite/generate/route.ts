@@ -1,4 +1,3 @@
-
 import { NextResponse } from "next/server";
 import sharp from "sharp";
 
@@ -108,12 +107,30 @@ async function sliceAndStitchTo576x24(sourcePng: Buffer) {
   return final;
 }
 
-async function openaiGenerateGrid(prompt: string) {
+async function resizeTo128(png: Buffer) {
+  return await sharp(png)
+    .resize(128, 128, { kernel: sharp.kernel.nearest })
+    .png()
+    .toBuffer();
+}
+
+async function openaiGenerateImage(prompt: string, mode: "concept" | "sheet") {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
 
-  // Prompt for a 5x5 grid
-  const systemPrompt = `
+  let systemPrompt = "";
+  if (mode === "concept") {
+    systemPrompt = `
+You are a pixel art concept artist.
+Generate ONE single 24x24 pixel art character on a transparent background.
+- Style: Retro, NES/SNES, clean lines, readable silhouette.
+- View: Front-facing or 3/4 view (idle stance).
+- Dimensions: The character must fit within a 24x24 pixel box.
+- Output: A single transparent PNG (approx 256x256 or 512x512, will be downscaled).
+`.trim();
+  } else {
+    // Sheet mode: The "Strict Generator" logic
+    systemPrompt = `
 You are a pixel art generator.
 Generate a valid 5x5 GRID of sprites.
 - The output image is square (e.g. 1024x1024).
@@ -125,7 +142,9 @@ Generate a valid 5x5 GRID of sprites.
 - Style: Retro pixel art, NES/SNES style.
 - Rows 1: Idle animation frames.
 - Rows 2-5: Walk cycle & action frames.
+- Consistency: MUST match the user's provided character concept EXACTLY.
 `.trim();
+  }
 
   const body = {
     model: "gpt-image-1",
@@ -157,29 +176,42 @@ Generate a valid 5x5 GRID of sprites.
 
 export async function POST(req: Request) {
   try {
-    const { name, prompt } = await req.json();
-    if (!name || !prompt) return NextResponse.json({ error: "Missing name/prompt" }, { status: 400 });
+    const { name, prompt, mode } = await req.json();
+    const modeVal = mode === "concept" ? "concept" : "sheet";
+
+    if (!prompt) return NextResponse.json({ error: "Missing prompt" }, { status: 400 });
 
     // Retry loop for transparency
     let raw: Buffer | null = null;
     for (let i = 0; i < 2; i++) {
-      const attempt = await openaiGenerateGrid(prompt);
+      const attempt = await openaiGenerateImage(prompt, modeVal);
       if (await hasAnyTransparency(attempt)) {
         raw = attempt;
         break;
       }
     }
-    if (!raw) raw = await openaiGenerateGrid(prompt); // Fallback to last attempt
+    if (!raw) raw = await openaiGenerateImage(prompt, modeVal);
 
-    // Process: Slice grid -> Stitch Strip
-    const finalPng = await sliceAndStitchTo576x24(raw!);
-    const metadata = atlasDataGenerator(name as CharacterName);
+    if (modeVal === "concept") {
+      // Return single preview image
+      const preview = await resizeTo128(raw!);
+      return NextResponse.json({
+        mode: "concept",
+        pngBase64: preview.toString("base64")
+      });
+    } else {
+      // Sheet mode: Slice & Stitch
+      // We assume 'prompt' here is the "strict" description
+      const finalPng = await sliceAndStitchTo576x24(raw!);
+      const metadata = name ? atlasDataGenerator(name as CharacterName) : {};
 
-    return NextResponse.json({
-      name,
-      pngBase64: finalPng.toString("base64"),
-      metadata
-    });
+      return NextResponse.json({
+        mode: "sheet",
+        name,
+        pngBase64: finalPng.toString("base64"),
+        metadata
+      });
+    }
 
   } catch (e: any) {
     console.error(e);
