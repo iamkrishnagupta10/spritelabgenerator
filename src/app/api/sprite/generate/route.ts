@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import sharp from "sharp";
-import { smartSlice } from "@/lib/smartSlice";
 
 type CharacterName = "doux" | "mort" | "targ" | "vita";
 
@@ -44,7 +43,39 @@ async function hasAnyTransparency(png: Buffer) {
   return false;
 }
 
+// Simple Grid Slicer (Divide & Conquer)
+async function sliceGrid(sourcePng: Buffer, rows: number, cols: number) {
+  const sourceImage = sharp(sourcePng).ensureAlpha();
+  const meta = await sourceImage.metadata();
+  const width = meta.width || 1024;
+  const height = meta.height || 1024;
 
+  const cellW = Math.floor(width / cols);
+  const cellH = Math.floor(height / rows);
+
+  const frames: Buffer[] = [];
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const buffer = await sourceImage
+        .clone()
+        .extract({
+          left: col * cellW,
+          top: row * cellH,
+          width: cellW,
+          height: cellH,
+        })
+        .trim() // Auto-crop to content
+        .resize(24, 24, {
+          fit: "contain",
+          background: { r: 0, g: 0, b: 0, alpha: 0 },
+          kernel: sharp.kernel.nearest,
+        })
+        .toBuffer();
+      frames.push(buffer);
+    }
+  }
+  return frames;
+}
 
 async function resizeTo128(png: Buffer) {
   return await sharp(png)
@@ -53,11 +84,15 @@ async function resizeTo128(png: Buffer) {
     .toBuffer();
 }
 
-async function openaiGenerateImage(prompt: string, mode: "concept" | "sheet") {
+type Mode = "concept" | "idle" | "walk";
+
+async function openaiGenerateImage(prompt: string, mode: Mode) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
 
   let systemPrompt = "";
+  let size = "1024x1024";
+
   if (mode === "concept") {
     systemPrompt = `
 You are a pixel art concept artist.
@@ -65,26 +100,29 @@ Generate ONE single 24x24 pixel art character on a transparent background.
 - Style: Retro, NES/SNES, clean lines, readable silhouette.
 - View: Front-facing or 3/4 view (idle stance).
 - Dimensions: The character must fit within a 24x24 pixel box.
-- Output: A single transparent PNG (approx 256x256 or 512x512, will be downscaled).
+- Output: A single transparent PNG.
 `.trim();
-  } else {
-    // Sheet mode: STRICT ALIGNMENT
+  } else if (mode === "idle") {
+    // 2x2 Grid = 4 Frames
     systemPrompt = `
 You are a pixel art generator.
-Generate a valid 5x5 GRID of sprites.
-- The output image is square (e.g. 1024x1024).
-- Divide it visually into 5 rows (Row 1 to Row 5) and 5 columns.
-- Place ONE character sprite in each cell.
-
-STRICT ROW CONTENTS:
-- Row 1 (Top): 5 frames of IDLE animation (breathing, subtle movement).
-- Row 2 (2nd down): 5 frames of WALK cycle (Side view walking).
-- Row 3 (3rd down): 5 frames continuing the walk cycle or running.
-- Row 4/5: Variations.
-
-- Background MUST be transparent.
-- Characters should be small, centered in their grid cells.
-- Consistency: MATCH the concept prompt exactly.
+Generate a clean 2x2 GRID (2 rows, 2 columns) of sprites.
+- Total 4 frames.
+- Content: 4 frames of IDLE animation (breathing, bobbing) for the character.
+- Background: Transparent.
+- Layout: 2 rows, 2 columns.
+- Style: Match the concept exactly.
+`.trim();
+  } else if (mode === "walk") {
+    // 2x3 Grid (3 rows, 2 cols) = 6 Frames
+    systemPrompt = `
+You are a pixel art generator.
+Generate a clean 3x2 GRID (3 rows, 2 columns) of sprites.
+- Total 6 frames.
+- Content: 6 frames of WALK cycle (Side view) for the character.
+- Background: Transparent.
+- Layout: 3 rows, 2 columns.
+- Style: Match the concept exactly.
 `.trim();
   }
 
@@ -92,7 +130,7 @@ STRICT ROW CONTENTS:
     model: "gpt-image-1",
     prompt: `${systemPrompt}\n\nUser Concept: ${prompt}`,
     background: "transparent",
-    size: "1024x1024",
+    size: size,
   };
 
   const r = await fetch("https://api.openai.com/v1/images/generations", {
@@ -119,31 +157,81 @@ STRICT ROW CONTENTS:
 export async function POST(req: Request) {
   try {
     const { name, prompt, mode } = await req.json();
-    const modeVal = mode === "concept" ? "concept" : "sheet";
 
     if (!prompt) return NextResponse.json({ error: "Missing prompt" }, { status: 400 });
 
-    // Retry loop for transparency
-    let raw: Buffer | null = null;
-    for (let i = 0; i < 2; i++) {
-      const attempt = await openaiGenerateImage(prompt, modeVal);
-      if (await hasAnyTransparency(attempt)) {
-        raw = attempt;
-        break;
+    if (mode === "concept") {
+      // Concept Mode: Generate Single Preview
+      let raw: Buffer | null = null;
+      for (let i = 0; i < 2; i++) {
+        const attempt = await openaiGenerateImage(prompt, "concept");
+        if (await hasAnyTransparency(attempt)) {
+          raw = attempt;
+          break;
+        }
       }
-    }
-    if (!raw) raw = await openaiGenerateImage(prompt, modeVal);
+      if (!raw) raw = await openaiGenerateImage(prompt, "concept");
 
-    if (modeVal === "concept") {
-      // Return single preview image
       const preview = await resizeTo128(raw!);
       return NextResponse.json({
         mode: "concept",
         pngBase64: preview.toString("base64")
       });
+
     } else {
-      // Sheet mode: Strict Smart Slice & Map
-      const finalPng = await smartSlice(raw!);
+      // Sheet Mode: PARALLEL GENERATION
+      // 1. Idle (2x2)
+      // 2. Walk (3x2)
+
+      const [idleRaw, walkRaw] = await Promise.all([
+        openaiGenerateImage(prompt, "idle"),
+        openaiGenerateImage(prompt, "walk")
+      ]);
+
+      // Helper to process robustly with retry if solid block? 
+      // For now assume "sheet" mode generators are reliable enough or user can retry.
+
+      // Slice
+      // Idle: 2x2 -> 4 frames
+      const idleFrames = await sliceGrid(idleRaw, 2, 2);
+
+      // Walk: 3 rows, 2 cols -> 6 frames
+      const walkFrames = await sliceGrid(walkRaw, 3, 2);
+
+      // Assembly
+      const destFrames: Buffer[] = new Array(24).fill(null);
+      const blank = await sharp({
+        create: { width: 24, height: 24, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } }
+      }).png().toBuffer();
+
+      // 0-3: Idle
+      for (let i = 0; i < 4; i++) destFrames[i] = idleFrames[i] || blank;
+
+      // 4-9: Walk
+      for (let i = 0; i < 6; i++) destFrames[4 + i] = walkFrames[i] || blank;
+
+      // 10-23: Blank
+      for (let i = 10; i < 24; i++) destFrames[i] = blank;
+
+      // Stitch
+      const compositeOps = destFrames.map((buf, idx) => ({
+        input: buf || blank,
+        left: idx * 24,
+        top: 0,
+      }));
+
+      const finalPng = await sharp({
+        create: {
+          width: 576,
+          height: 24,
+          channels: 4,
+          background: { r: 0, g: 0, b: 0, alpha: 0 },
+        },
+      })
+        .composite(compositeOps)
+        .png()
+        .toBuffer();
+
       const metadata = name ? atlasDataGenerator(name as CharacterName) : {};
 
       return NextResponse.json({
