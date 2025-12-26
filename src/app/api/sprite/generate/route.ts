@@ -11,7 +11,7 @@ function atlasDataGenerator(name: CharacterName) {
       image: `/characters/${name}.png`,
       format: "RGBA8888",
       size: { w: 576, h: 24 },
-      scale: "0.32",
+      scale: "1",
     },
     animations: {
       walk: [`4_${name}`, `5_${name}`, `6_${name}`, `7_${name}`, `8_${name}`, `9_${name}`],
@@ -30,60 +30,107 @@ function atlasDataGenerator(name: CharacterName) {
   return baseAtlas;
 }
 
+// Check alpha transparency
 async function hasAnyTransparency(png: Buffer) {
-  const { data, info } = await sharp(png)
+  const { data } = await sharp(png)
     .ensureAlpha()
     .raw()
     .toBuffer({ resolveWithObject: true });
 
-  // RGBA bytes; check if any alpha < 255
   for (let i = 3; i < data.length; i += 4) {
     if (data[i] < 255) return true;
   }
   return false;
 }
 
-async function forceTo576x24(png: Buffer) {
-  const out = await sharp(png)
-    .ensureAlpha()
-    .resize(576, 24, { fit: "fill", kernel: sharp.kernel.nearest }) // crisp pixels
+// Slice a 5x5 grid from the 1024x1024 source and stitch the first 24 into a 1x24 strip
+async function sliceAndStitchTo576x24(sourcePng: Buffer) {
+  // 1. Get raw dimensions just to be sure
+  const sourceImage = sharp(sourcePng).ensureAlpha();
+  const meta = await sourceImage.metadata();
+  const width = meta.width || 1024;
+  const height = meta.height || 1024;
+
+  // We assume a 5x5 grid in the square image.
+  // Cell size = width / 5.
+  const cellW = Math.floor(width / 5);
+  const cellH = Math.floor(height / 5);
+
+  const frames: Buffer[] = [];
+
+  // Extract 25 frames (rows 0..4, cols 0..4), keep first 24.
+  let count = 0;
+  for (let row = 0; row < 5; row++) {
+    for (let col = 0; col < 5; col++) {
+      if (count >= 24) break;
+
+      // Extract region
+      const buffer = await sourceImage
+        .clone()
+        .extract({
+          left: col * cellW,
+          top: row * cellH,
+          width: cellW,
+          height: cellH,
+        })
+        .resize(24, 24, {
+          fit: "contain",
+          background: { r: 0, g: 0, b: 0, alpha: 0 },
+          kernel: sharp.kernel.nearest,
+        }) // Resize perfectly to 24x24 pixel art
+        .toBuffer();
+
+      frames.push(buffer);
+      count++;
+    }
+  }
+
+  // Composite frames into a 576x24 canvas
+  // X offsets: 0, 24, 48, ...
+  const compositeOps = frames.map((buf, idx) => ({
+    input: buf,
+    left: idx * 24,
+    top: 0,
+  }));
+
+  const final = await sharp({
+    create: {
+      width: 576,
+      height: 24,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    },
+  })
+    .composite(compositeOps)
     .png()
     .toBuffer();
 
-  const meta = await sharp(out).metadata();
-  if (meta.width !== 576 || meta.height !== 24) {
-    throw new Error(`Size mismatch: got ${meta.width}x${meta.height}`);
-  }
-  return out;
+  return final;
 }
 
-async function openaiGenerateTransparentSpritesheet(prompt: string) {
+async function openaiGenerateGrid(prompt: string) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
 
-  const hardReqs = `
-Generate a SINGLE PNG spritesheet with TRANSPARENT background.
-Layout:
-- 24 frames in ONE row
-- each frame exactly 24x24 pixels
-- final intended layout: 576x24 (24*24 by 24)
-Animation meaning:
-- frames 0-3: idle (breathing/blink)
-- frames 4-9: walk cycle (6 frames)
-- frames 10-23: extra subtle variants consistent with character
-Style:
-- pixel art, sharp edges, no blur, consistent proportions
-- character reads well at 24x24
-- NO background pixels; alpha transparency outside sprite.
+  // Prompt for a 5x5 grid
+  const systemPrompt = `
+You are a pixel art generator.
+Generate a valid 5x5 GRID of sprites.
+- The output image is square (e.g. 1024x1024).
+- Divide it visually into 5 rows and 5 columns.
+- Place ONE character sprite in each cell.
+- Total 25 sprites (we will use the first 24).
+- Background MUST be transparent.
+- Characters should be small, centered in their grid cells.
+- Style: Retro pixel art, NES/SNES style.
+- Rows 1: Idle animation frames.
+- Rows 2-5: Walk cycle & action frames.
 `.trim();
 
-  // OpenAI Images API (gpt-image-1). Request transparent background.
   const body = {
     model: "gpt-image-1",
-    prompt: `${hardReqs}\n\nCharacter request:\n${prompt}`,
-    // The API supports transparency via background=transparent in many accounts.
+    prompt: `${systemPrompt}\n\nUser Concept: ${prompt}`,
     background: "transparent",
-    // size constraints are model dependent; we’ll enforce exact 576x24 after.
     size: "1024x1024",
   };
 
@@ -98,42 +145,44 @@ Style:
 
   if (!r.ok) {
     const text = await r.text().catch(() => "");
-    throw new Error(`OpenAI image gen failed (${r.status}): ${text || "no body"}`);
+    throw new Error(`OpenAI error (${r.status}): ${text}`);
   }
 
   const json = await r.json();
   const b64 = json?.data?.[0]?.b64_json;
-  if (!b64) throw new Error("OpenAI returned no b64_json");
+  if (!b64) throw new Error("No b64_json returned");
 
   return Buffer.from(b64, "base64");
 }
 
 export async function POST(req: Request) {
   try {
-    const { name, prompt } = (await req.json()) as { name: CharacterName; prompt: string };
-    if (!name || !prompt) return NextResponse.json({ error: "Missing name or prompt" }, { status: 400 });
+    const { name, prompt } = await req.json();
+    if (!name || !prompt) return NextResponse.json({ error: "Missing name/prompt" }, { status: 400 });
 
-    // Try a few times until we get actual transparency
-    let img: Buffer | null = null;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      const raw = await openaiGenerateTransparentSpritesheet(prompt);
-      const ok = await hasAnyTransparency(raw);
-      if (ok) {
-        img = raw;
+    // Retry loop for transparency
+    let raw: Buffer | null = null;
+    for (let i = 0; i < 2; i++) {
+      const attempt = await openaiGenerateGrid(prompt);
+      if (await hasAnyTransparency(attempt)) {
+        raw = attempt;
         break;
       }
     }
-    if (!img) throw new Error("OpenAI did not return a transparent PNG after 3 attempts.");
+    if (!raw) raw = await openaiGenerateGrid(prompt); // Fallback to last attempt
 
-    const finalPng = await forceTo576x24(img);
-    const metadata = atlasDataGenerator(name);
+    // Process: Slice grid -> Stitch Strip
+    const finalPng = await sliceAndStitchTo576x24(raw!);
+    const metadata = atlasDataGenerator(name as CharacterName);
 
     return NextResponse.json({
       name,
       pngBase64: finalPng.toString("base64"),
-      metadata,
+      metadata
     });
+
   } catch (e: any) {
-    return NextResponse.json({ error: e?.message ?? "Unknown error" }, { status: 500 });
+    console.error(e);
+    return NextResponse.json({ error: e.message || "Internal error" }, { status: 500 });
   }
 }
