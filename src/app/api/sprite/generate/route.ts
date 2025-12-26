@@ -68,6 +68,7 @@ async function sliceAndStitchStrict(sourcePng: Buffer) {
           width: cellW,
           height: cellH,
         })
+        .trim() // Auto-crop the sprite content!
         .resize(24, 24, {
           fit: "contain",
           background: { r: 0, g: 0, b: 0, alpha: 0 },
