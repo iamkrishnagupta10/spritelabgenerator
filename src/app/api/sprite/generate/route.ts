@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import sharp from "sharp";
+import { smartSlice } from "@/lib/smartSlice";
 
 type CharacterName = "doux" | "mort" | "targ" | "vita";
 
