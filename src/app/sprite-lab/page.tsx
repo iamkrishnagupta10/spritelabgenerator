@@ -1,1 +1,1 @@
-export { default } from '@/components/SpriteLab';
+export { default } from '../../components/SpriteLab';
