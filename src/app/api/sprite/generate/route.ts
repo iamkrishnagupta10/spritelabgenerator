@@ -141,8 +141,8 @@ export async function POST(req: Request) {
         pngBase64: preview.toString("base64")
       });
     } else {
-      // Sheet mode: Strict Slice & Map
-      const finalPng = await sliceAndStitchStrict(raw!);
+      // Sheet mode: Strict Smart Slice & Map
+      const finalPng = await smartSlice(raw!);
       const metadata = name ? atlasDataGenerator(name as CharacterName) : {};
 
       return NextResponse.json({
