@@ -1,0 +1,1 @@
+export default function Home(){return <a href="/sprite-lab">Open Sprite Lab</a>}
