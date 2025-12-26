@@ -283,7 +283,6 @@ export default function SpriteLab() {
                 </div>
                 <div style={{ display: "flex", alignItems: "center" }}>
                   <button onClick={downloadPng} style={styles.btnPrimary}>Download PNG</button>
-                  <button onClick={downloadMetadata} style={styles.btnSecondary}>Download JSON</button>
                 </div>
               </div>
             )}
