@@ -43,39 +43,7 @@ async function hasAnyTransparency(png: Buffer) {
   return false;
 }
 
-// Simple Grid Slicer (Divide & Conquer)
-async function sliceGrid(sourcePng: Buffer, rows: number, cols: number) {
-  const sourceImage = sharp(sourcePng).ensureAlpha();
-  const meta = await sourceImage.metadata();
-  const width = meta.width || 1024;
-  const height = meta.height || 1024;
 
-  const cellW = Math.floor(width / cols);
-  const cellH = Math.floor(height / rows);
-
-  const frames: Buffer[] = [];
-  for (let row = 0; row < rows; row++) {
-    for (let col = 0; col < cols; col++) {
-      const buffer = await sourceImage
-        .clone()
-        .extract({
-          left: col * cellW,
-          top: row * cellH,
-          width: cellW,
-          height: cellH,
-        })
-        .trim() // Auto-crop to content
-        .resize(24, 24, {
-          fit: "contain",
-          background: { r: 0, g: 0, b: 0, alpha: 0 },
-          kernel: sharp.kernel.nearest,
-        })
-        .toBuffer();
-      frames.push(buffer);
-    }
-  }
-  return frames;
-}
 
 async function resizeTo128(png: Buffer) {
   return await sharp(png)
@@ -84,9 +52,9 @@ async function resizeTo128(png: Buffer) {
     .toBuffer();
 }
 
-type Mode = "concept" | "idle" | "walk";
+type Mode = "concept" | "frame";
 
-async function openaiGenerateImage(prompt: string, mode: Mode) {
+async function openaiGenerateImage(prompt: string, mode: Mode, frameDesc?: string) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
 
@@ -94,6 +62,7 @@ async function openaiGenerateImage(prompt: string, mode: Mode) {
   let size = "1024x1024";
 
   if (mode === "concept") {
+    // ... same as before
     systemPrompt = `
 You are a pixel art concept artist.
 Generate ONE single 24x24 pixel art character on a transparent background.
@@ -102,27 +71,17 @@ Generate ONE single 24x24 pixel art character on a transparent background.
 - Dimensions: The character must fit within a 24x24 pixel box.
 - Output: A single transparent PNG.
 `.trim();
-  } else if (mode === "idle") {
-    // 2x2 Grid = 4 Frames
+  } else {
+    // Frame Mode: Generate 1 specific frame
     systemPrompt = `
-You are a pixel art generator.
-Generate a clean 2x2 GRID (2 rows, 2 columns) of sprites.
-- Total 4 frames.
-- Content: 4 frames of IDLE animation (breathing, bobbing) for the character.
+You are a pixel art sprite generator.
+Generate ONE single 24x24 pixel art character frame.
+- Action: ${frameDesc || "Idle"}.
+- Style: Retro, NES/SNES.
+- View: Side view or 3/4 view as appropriate for the action.
+- Constraint: The character MUST be fully visible, centered, and fit in 24x24 pixels.
 - Background: Transparent.
-- Layout: 2 rows, 2 columns.
-- Style: Match the concept exactly.
-`.trim();
-  } else if (mode === "walk") {
-    // 2x3 Grid (3 rows, 2 cols) = 6 Frames
-    systemPrompt = `
-You are a pixel art generator.
-Generate a clean 3x2 GRID (3 rows, 2 columns) of sprites.
-- Total 6 frames.
-- Content: 6 frames of WALK cycle (Side view) for the character.
-- Background: Transparent.
-- Layout: 3 rows, 2 columns.
-- Style: Match the concept exactly.
+- Consistency: Match the user's concept description perfectly.
 `.trim();
   }
 
@@ -179,24 +138,46 @@ export async function POST(req: Request) {
       });
 
     } else {
-      // Sheet Mode: PARALLEL GENERATION
-      // 1. Idle (2x2)
-      // 2. Walk (3x2)
+      // ATOMIC GENERATION: 10 Separate Cals
+      // 1. Idle x4
+      // 2. Walk x6
 
-      const [idleRaw, walkRaw] = await Promise.all([
-        openaiGenerateImage(prompt, "idle"),
-        openaiGenerateImage(prompt, "walk")
+      // Helper for single frame prompt
+      const generateFrame = (type: "idle" | "walk", index: number) => {
+        const framePrompt = type === "idle"
+          ? `Idle Animation Frame ${index + 1}/4 (Standing, breathing, subtle move)`
+          : `Walk Cycle Frame ${index + 1}/6 (Side view walking step)`;
+
+        return openaiGenerateImage(prompt, "frame", framePrompt);
+      };
+
+      // Launch all 10 requests in parallel
+      const [i0, i1, i2, i3, w0, w1, w2, w3, w4, w5] = await Promise.all([
+        generateFrame("idle", 0),
+        generateFrame("idle", 1),
+        generateFrame("idle", 2),
+        generateFrame("idle", 3),
+        generateFrame("walk", 0),
+        generateFrame("walk", 1),
+        generateFrame("walk", 2),
+        generateFrame("walk", 3),
+        generateFrame("walk", 4),
+        generateFrame("walk", 5),
       ]);
 
-      // Helper to process robustly with retry if solid block? 
-      // For now assume "sheet" mode generators are reliable enough or user can retry.
-
-      // Slice
-      // Idle: 2x2 -> 4 frames
-      const idleFrames = await sliceGrid(idleRaw, 2, 2);
-
-      // Walk: 3 rows, 2 cols -> 6 frames
-      const walkFrames = await sliceGrid(walkRaw, 3, 2);
+      // Resize all to 24x24
+      const processedFrames = await Promise.all(
+        [i0, i1, i2, i3, w0, w1, w2, w3, w4, w5].map(async (buf) => {
+          // Resize logic: Ensure it fits 24x24 container
+          return sharp(buf)
+            .resize(24, 24, {
+              fit: "contain",
+              background: { r: 0, g: 0, b: 0, alpha: 0 },
+              kernel: sharp.kernel.nearest
+            })
+            .toBuffer();
+        })
+      );
 
       // Assembly
       const destFrames: Buffer[] = new Array(24).fill(null);
@@ -204,13 +185,12 @@ export async function POST(req: Request) {
         create: { width: 24, height: 24, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } }
       }).png().toBuffer();
 
-      // 0-3: Idle
-      for (let i = 0; i < 4; i++) destFrames[i] = idleFrames[i] || blank;
-
-      // 4-9: Walk
-      for (let i = 0; i < 6; i++) destFrames[4 + i] = walkFrames[i] || blank;
-
-      // 10-23: Blank
+      // Fill slots
+      // 0-3 Idle
+      processedFrames.slice(0, 4).forEach((buf, i) => destFrames[i] = buf);
+      // 4-9 Walk
+      processedFrames.slice(4, 10).forEach((buf, i) => destFrames[4 + i] = buf);
+      // Rest Blank
       for (let i = 10; i < 24; i++) destFrames[i] = blank;
 
       // Stitch
